@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -35,6 +36,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.synccut.app.core.model.MediaType
+import com.synccut.app.core.model.Rational
 import com.synccut.app.core.model.SourceMedia
 import com.synccut.app.core.model.SyncOffset
 import com.synccut.app.ui.theme.AccentBlue
@@ -51,10 +53,12 @@ fun SyncWorkspaceSheet(
     mediaList: List<SourceMedia>,
     offsets: Map<String, SyncOffset>,
     referenceMediaId: String?,
+    projectFps: Rational = Rational.FPS_30,
     onSelectReference: (String) -> Unit,
     onRunAudioSync: () -> Unit,
     onApplySyncToTimeline: () -> Unit,
-    onAdjustOffsetFrames: (mediaId: String, frameDelta: Long) -> Unit
+    onAdjustOffsetFrames: (mediaId: String, frameDelta: Long) -> Unit,
+    onAdjustOffsetMillis: (mediaId: String, millisDelta: Long) -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -75,7 +79,7 @@ fun SyncWorkspaceSheet(
                     color = TextPrimary
                 )
                 Text(
-                    text = "Align all camera videos with master reference track",
+                    text = "Sub-millisecond waveform alignment across all cameras",
                     fontSize = 12.sp,
                     color = TextSecondary
                 )
@@ -89,7 +93,7 @@ fun SyncWorkspaceSheet(
                 ) {
                     Icon(Icons.Default.Sync, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Sync All", fontSize = 12.sp)
+                    Text("Auto-Sync", fontSize = 12.sp)
                 }
 
                 if (offsets.isNotEmpty()) {
@@ -100,16 +104,16 @@ fun SyncWorkspaceSheet(
                     ) {
                         Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Apply Sync", fontSize = 12.sp)
+                        Text("Apply", fontSize = 12.sp)
                     }
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
         if (mediaList.isEmpty()) {
-            Text("Import clips to synchronize.", color = TextSecondary, fontSize = 13.sp)
+            Text("Import camera clips to synchronize.", color = TextSecondary, fontSize = 13.sp)
         } else {
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -132,6 +136,7 @@ fun SyncWorkspaceSheet(
                             )
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
+                            // Header row: Icon, Name, Reference Tag
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -139,7 +144,7 @@ fun SyncWorkspaceSheet(
                             ) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Icon(
-                                        if (isAudio) Icons.Default.Audiotrack else Icons.Default.GraphicEq,
+                                        if (isAudio) Icons.Default.Audiotrack else Icons.Default.Videocam,
                                         contentDescription = null,
                                         tint = if (isRef) AccentGreen else if (isAudio) AccentBlue else TextSecondary,
                                         modifier = Modifier.size(20.dp)
@@ -153,7 +158,7 @@ fun SyncWorkspaceSheet(
                                             color = TextPrimary
                                         )
                                         Text(
-                                            text = if (isAudio) "Master Audio" else "Camera Video",
+                                            text = if (isAudio) "Master External Audio" else "Camera Angle Video",
                                             fontSize = 10.sp,
                                             color = TextSecondary
                                         )
@@ -166,7 +171,7 @@ fun SyncWorkspaceSheet(
                                             .background(AccentGreen.copy(alpha = 0.2f), RoundedCornerShape(4.dp))
                                             .padding(horizontal = 6.dp, vertical = 2.dp)
                                     ) {
-                                        Text("REFERENCE", fontSize = 10.sp, color = AccentGreen, fontWeight = FontWeight.Bold)
+                                        Text("MASTER REF", fontSize = 9.sp, color = AccentGreen, fontWeight = FontWeight.Bold)
                                     }
                                 } else {
                                     Box(
@@ -174,7 +179,7 @@ fun SyncWorkspaceSheet(
                                             .clickable { onSelectReference(media.id) }
                                             .padding(4.dp)
                                     ) {
-                                        Text("Set as Reference", fontSize = 11.sp, color = AccentBlue)
+                                        Text("Set Reference", fontSize = 11.sp, color = AccentBlue)
                                     }
                                 }
                             }
@@ -183,10 +188,13 @@ fun SyncWorkspaceSheet(
                                 Spacer(modifier = Modifier.height(8.dp))
                                 val confidence = offset?.confidence ?: 0f
                                 val confColor = when {
-                                    confidence >= 0.75f -> AccentGreen
-                                    confidence >= 0.50f -> AccentBlue
+                                    confidence >= 0.70f -> AccentGreen
+                                    confidence >= 0.45f -> AccentBlue
                                     else -> AccentRed
                                 }
+
+                                val offsetMs = (offset?.totalOffsetUs ?: 0L) / 1000L
+                                val offsetFrames = projectFps.microsecondsToFrames(offset?.totalOffsetUs ?: 0L)
 
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
@@ -194,38 +202,75 @@ fun SyncWorkspaceSheet(
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Text(
-                                        text = "Sync Offset: ${(offset?.totalOffsetUs ?: 0L) / 1000L} ms",
+                                        text = "Offset: ${offsetMs} ms ($offsetFrames frames)",
                                         fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
                                         color = TextPrimary
                                     )
                                     Text(
-                                        text = "Confidence: ${(confidence * 100).toInt()}%",
+                                        text = "Sync: ${(confidence * 100).toInt()}% Confidence",
                                         fontSize = 12.sp,
-                                        fontWeight = FontWeight.Medium,
+                                        fontWeight = FontWeight.SemiBold,
                                         color = confColor
                                     )
                                 }
 
                                 Spacer(modifier = Modifier.height(8.dp))
 
-                                // Fine Manual Adjustment Buttons (-1 frame, +1 frame)
+                                // Fine Manual Adjustment Buttons (-5, -1, +1, +5 frames & ms)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    OutlinedButton(
+                                        onClick = { onAdjustOffsetFrames(media.id, -5) },
+                                        modifier = Modifier.weight(1f).height(30.dp),
+                                        shape = RoundedCornerShape(4.dp)
+                                    ) {
+                                        Text("-5f", fontSize = 9.sp, color = TextPrimary)
+                                    }
+                                    OutlinedButton(
+                                        onClick = { onAdjustOffsetFrames(media.id, -1) },
+                                        modifier = Modifier.weight(1f).height(30.dp),
+                                        shape = RoundedCornerShape(4.dp)
+                                    ) {
+                                        Text("-1f", fontSize = 9.sp, color = TextPrimary)
+                                    }
+                                    OutlinedButton(
+                                        onClick = { onAdjustOffsetFrames(media.id, 1) },
+                                        modifier = Modifier.weight(1f).height(30.dp),
+                                        shape = RoundedCornerShape(4.dp)
+                                    ) {
+                                        Text("+1f", fontSize = 9.sp, color = TextPrimary)
+                                    }
+                                    OutlinedButton(
+                                        onClick = { onAdjustOffsetFrames(media.id, 5) },
+                                        modifier = Modifier.weight(1f).height(30.dp),
+                                        shape = RoundedCornerShape(4.dp)
+                                    ) {
+                                        Text("+5f", fontSize = 9.sp, color = TextPrimary)
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(4.dp))
+
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
                                     OutlinedButton(
-                                        onClick = { onAdjustOffsetFrames(media.id, -1) },
-                                        modifier = Modifier.weight(1f).height(32.dp),
+                                        onClick = { onAdjustOffsetMillis(media.id, -50) },
+                                        modifier = Modifier.weight(1f).height(28.dp),
                                         shape = RoundedCornerShape(4.dp)
                                     ) {
-                                        Text("-1 Frame", fontSize = 10.sp, color = TextPrimary)
+                                        Text("-50ms", fontSize = 9.sp, color = TextSecondary)
                                     }
                                     OutlinedButton(
-                                        onClick = { onAdjustOffsetFrames(media.id, 1) },
-                                        modifier = Modifier.weight(1f).height(32.dp),
+                                        onClick = { onAdjustOffsetMillis(media.id, 50) },
+                                        modifier = Modifier.weight(1f).height(28.dp),
                                         shape = RoundedCornerShape(4.dp)
                                     ) {
-                                        Text("+1 Frame", fontSize = 10.sp, color = TextPrimary)
+                                        Text("+50ms", fontSize = 9.sp, color = TextSecondary)
                                     }
                                 }
                             }

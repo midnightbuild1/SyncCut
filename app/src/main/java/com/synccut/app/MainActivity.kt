@@ -1,8 +1,10 @@
 package com.synccut.app
 
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -23,15 +25,20 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoFixHigh
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.FastForward
 import androidx.compose.material.icons.filled.FastRewind
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -44,7 +51,6 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -55,6 +61,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -74,6 +81,8 @@ import com.synccut.app.engine.autocut.AutoCutEngine
 import com.synccut.app.engine.export.ExportEngine
 import com.synccut.app.engine.media.MediaMetadataExtractor
 import com.synccut.app.engine.playback.PlaybackEngine
+import com.synccut.app.engine.sync.AudioPcmExtractor
+import com.synccut.app.engine.sync.CrossCorrelationSync
 import com.synccut.app.engine.sync.SyncEngine
 import com.synccut.app.engine.timeline.TimelineManager
 import com.synccut.app.ui.autocut.AutoCutReviewSheet
@@ -91,7 +100,10 @@ import com.synccut.app.ui.theme.SyncCutTheme
 import com.synccut.app.ui.theme.TextPrimary
 import com.synccut.app.ui.theme.TextSecondary
 import com.synccut.app.ui.timeline.TimelineView
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
 
@@ -107,6 +119,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var playbackEngine: PlaybackEngine
     private lateinit var mediaExtractor: MediaMetadataExtractor
+    private lateinit var audioPcmExtractor: AudioPcmExtractor
     private lateinit var syncEngine: SyncEngine
     private lateinit var autoCutEngine: AutoCutEngine
     private lateinit var exportEngine: ExportEngine
@@ -116,6 +129,7 @@ class MainActivity : ComponentActivity() {
 
         playbackEngine = PlaybackEngine(this)
         mediaExtractor = MediaMetadataExtractor(this)
+        audioPcmExtractor = AudioPcmExtractor(this)
         syncEngine = SyncEngine()
         autoCutEngine = AutoCutEngine()
         exportEngine = ExportEngine(this)
@@ -160,6 +174,7 @@ class MainActivity : ComponentActivity() {
                         repository = repository,
                         playbackEngine = playbackEngine,
                         mediaExtractor = mediaExtractor,
+                        audioPcmExtractor = audioPcmExtractor,
                         syncEngine = syncEngine,
                         autoCutEngine = autoCutEngine,
                         exportEngine = exportEngine,
@@ -186,6 +201,7 @@ fun EditorScreen(
     repository: com.synccut.app.data.local.repository.ProjectRepository,
     playbackEngine: PlaybackEngine,
     mediaExtractor: MediaMetadataExtractor,
+    audioPcmExtractor: AudioPcmExtractor,
     syncEngine: SyncEngine,
     autoCutEngine: AutoCutEngine,
     exportEngine: ExportEngine,
@@ -202,9 +218,14 @@ fun EditorScreen(
 
     var activeSheet by remember { mutableStateOf(EditorSheet.NONE) }
     var syncOffsets by remember { mutableStateOf<Map<String, SyncOffset>>(emptyMap()) }
+    var audioEnvelopes by remember { mutableStateOf<Map<String, FloatArray>>(emptyMap()) }
     var referenceMediaId by remember { mutableStateOf<String?>(null) }
+    var autoCutAggressiveness by remember { mutableStateOf(com.synccut.app.engine.autocut.AutoCutAggressiveness.BALANCED) }
     var autoCutSuggestions by remember { mutableStateOf<List<EditSuggestion>>(emptyList()) }
     var isExporting by remember { mutableStateOf(false) }
+
+    var statusMessage by remember { mutableStateOf<String?>(null) }
+    var isProcessingAudio by remember { mutableStateOf(false) }
 
     // Initialize timeline from repository
     LaunchedEffect(project.id) {
@@ -230,6 +251,146 @@ fun EditorScreen(
     LaunchedEffect(playbackState.currentPositionUs) {
         if (playbackState.isPlaying) {
             timelineManager.setPlayhead(playbackState.currentPositionUs)
+        }
+    }
+
+    // --- Automatic Sync Engine on Import ---
+    val runAutoSync = {
+        coroutineScope.launch {
+            if (mediaList.size < 2) return@launch
+            isProcessingAudio = true
+            statusMessage = "⚡ Analyzing audio waveforms across all camera angles..."
+
+            withContext(Dispatchers.Default) {
+                // Determine Reference Track: prioritize pure audio, or first media
+                val refMedia = mediaList.firstOrNull { it.mediaType == MediaType.AUDIO } ?: mediaList.first()
+                referenceMediaId = refMedia.id
+
+                val envelopes = mutableMapOf<String, FloatArray>()
+                for (m in mediaList) {
+                    val env = audioPcmExtractor.extractRmsEnvelope(Uri.parse(m.uri))
+                    envelopes[m.id] = env
+                }
+
+                val refEnvelope = envelopes[refMedia.id] ?: FloatArray(0)
+                val calculatedOffsets = mutableMapOf<String, SyncOffset>()
+
+                for (m in mediaList) {
+                    if (m.id == refMedia.id) {
+                        calculatedOffsets[m.id] = SyncOffset(
+                            syncGroupId = UUID.randomUUID().toString(),
+                            mediaId = m.id,
+                            offsetUs = 0L,
+                            confidence = 1.0f
+                        )
+                    } else {
+                        val targetEnv = envelopes[m.id] ?: FloatArray(0)
+                        val corr = CrossCorrelationSync.computeCorrelation(
+                            reference = refEnvelope,
+                            target = targetEnv,
+                            maxLagSamples = AudioPcmExtractor.TARGET_ENVELOPE_SAMPLE_RATE_HZ * 60
+                        )
+                        val offsetUs = CrossCorrelationSync.lagToMicroseconds(
+                            corr.fractionalLag,
+                            AudioPcmExtractor.TARGET_ENVELOPE_SAMPLE_RATE_HZ
+                        )
+                        calculatedOffsets[m.id] = SyncOffset(
+                            syncGroupId = UUID.randomUUID().toString(),
+                            mediaId = m.id,
+                            offsetUs = offsetUs.coerceAtLeast(0L),
+                            confidence = corr.confidence
+                        )
+                    }
+                }
+
+                syncOffsets = calculatedOffsets
+                audioEnvelopes = envelopes
+
+                // Instantly apply sync to all timeline clips so tracks slide into place
+                val updatedClips = timelineState.clips.map { clip ->
+                    val offset = calculatedOffsets[clip.sourceMediaId]
+                    if (offset != null) {
+                        clip.copy(timelineStartUs = offset.totalOffsetUs.coerceAtLeast(0L))
+                    } else clip
+                }
+
+                timelineManager.initialize(timelineState.tracks, updatedClips)
+            }
+
+            isProcessingAudio = false
+            statusMessage = "✓ Auto-Sync Completed! All camera angles aligned in timeline."
+            delay(4000)
+            statusMessage = null
+        }
+    }
+
+    // --- 1-Tap Auto-Cut (Silence & Pause Remover) ---
+    val runAutoCutSilences = {
+        coroutineScope.launch {
+            if (timelineState.clips.isEmpty()) return@launch
+            isProcessingAudio = true
+            statusMessage = "✂️ Scanning audio for awkward silences & pauses..."
+
+            withContext(Dispatchers.Default) {
+                // Find reference media or first media with audio
+                val refMedia = mediaList.firstOrNull { it.mediaType == MediaType.AUDIO } ?: mediaList.firstOrNull()
+                if (refMedia != null) {
+                    val envelope = audioEnvelopes[refMedia.id] ?: audioPcmExtractor.extractRmsEnvelope(Uri.parse(refMedia.uri))
+                    if (!audioEnvelopes.containsKey(refMedia.id)) {
+                        audioEnvelopes = audioEnvelopes + (refMedia.id to envelope)
+                    }
+                    val suggestions = autoCutEngine.analyzeMedia(
+                        sourceMediaId = refMedia.id,
+                        durationUs = refMedia.durationUs,
+                        audioRmsEnvelope = envelope,
+                        envelopeSampleRateHz = AudioPcmExtractor.TARGET_ENVELOPE_SAMPLE_RATE_HZ,
+                        aggressiveness = autoCutAggressiveness
+                    )
+
+                    autoCutSuggestions = suggestions
+
+                    if (suggestions.isNotEmpty()) {
+                        // Apply ripple cut across ALL tracks simultaneously so all angles stay in sync!
+                        val cutClips = autoCutEngine.rippleCutSilencesAcrossAllTracks(
+                            currentClips = timelineState.clips,
+                            acceptedCuts = suggestions
+                        )
+                        timelineManager.initialize(timelineState.tracks, cutClips)
+                        val totalCutDur = suggestions.sumOf { it.durationUs } / 1_000_000.0
+                        statusMessage = "✓ Auto-Cut: Removed ${suggestions.size} silences (${String.format("%.1f", totalCutDur)}s cut). Angles stayed in sync!"
+                    } else {
+                        statusMessage = "No long silences detected. Timeline is tight!"
+                    }
+                }
+            }
+
+            isProcessingAudio = false
+            delay(4000)
+            statusMessage = null
+        }
+    }
+
+    // --- Director Mode: Live Cut To Angle at Playhead ---
+    val cutToAngleAtPlayhead: (String) -> Unit = { targetMediaId ->
+        playbackEngine.switchCameraAngle(targetMediaId)
+        val playheadUs = timelineState.playheadUs
+        val activeVideoTrack = timelineState.tracks.firstOrNull { it.type == TrackType.VIDEO }
+        if (activeVideoTrack != null) {
+            val clipToCut = timelineState.clips.firstOrNull {
+                it.trackId == activeVideoTrack.id && playheadUs > it.timelineStartUs && playheadUs < it.timelineEndUs
+            }
+            if (clipToCut != null && clipToCut.sourceMediaId != targetMediaId) {
+                val cutOffsetUs = playheadUs - clipToCut.timelineStartUs
+                val part1 = clipToCut.copy(sourceOutUs = clipToCut.sourceInUs + cutOffsetUs)
+                val part2 = clipToCut.copy(
+                    id = UUID.randomUUID().toString(),
+                    sourceMediaId = targetMediaId,
+                    sourceInUs = clipToCut.sourceInUs + cutOffsetUs,
+                    timelineStartUs = playheadUs
+                )
+                val newClips = timelineState.clips.map { if (it.id == clipToCut.id) part1 else it } + part2
+                timelineManager.initialize(timelineState.tracks, newClips)
+            }
         }
     }
 
@@ -310,12 +471,55 @@ fun EditorScreen(
                     )
                 }
 
-                Button(
-                    onClick = { activeSheet = EditorSheet.EXPORT },
-                    colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
-                    shape = RoundedCornerShape(6.dp)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    // Quick Action: 1-Tap Auto Cut
+                    if (timelineState.clips.isNotEmpty()) {
+                        Button(
+                            onClick = { runAutoCutSilences() },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD97706)),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.height(34.dp)
+                        ) {
+                            Icon(Icons.Default.ContentCut, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Auto-Cut", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    Button(
+                        onClick = { activeSheet = EditorSheet.EXPORT },
+                        colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
+                        shape = RoundedCornerShape(6.dp),
+                        modifier = Modifier.height(34.dp)
+                    ) {
+                        Text("Export", fontSize = 11.sp)
+                    }
+                }
+            }
+
+            // Status Banner (Shows real-time auto-sync and auto-cut progress)
+            AnimatedVisibility(visible = statusMessage != null || isProcessingAudio) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(AccentBlue.copy(alpha = 0.9f))
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
                 ) {
-                    Text("Export", fontSize = 12.sp)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (isProcessingAudio) {
+                            CircularProgressIndicator(color = Color.White, modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Spacer(modifier = Modifier.width(8.dp))
+                        } else {
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+                        Text(
+                            text = statusMessage ?: "Processing...",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
                 }
             }
 
@@ -358,19 +562,38 @@ fun EditorScreen(
                 }
 
                 if (timelineState.clips.isEmpty()) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            text = "No footage on timeline",
-                            color = TextSecondary,
-                            fontSize = 14.sp
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Button(
-                            onClick = { activeSheet = EditorSheet.MEDIA_IMPORT },
-                            colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
-                            shape = RoundedCornerShape(6.dp)
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = DarkSurfaceElevated),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.padding(24.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(20.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            Text("Import Camera Videos", fontSize = 12.sp)
+                            Text(
+                                text = "Start Multi-Camera Project",
+                                color = TextPrimary,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Import 2+ video clips. SyncCut will auto-sync them by waveform.",
+                                color = TextSecondary,
+                                fontSize = 12.sp,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                            )
+                            Spacer(modifier = Modifier.height(14.dp))
+                            Button(
+                                onClick = { activeSheet = EditorSheet.MEDIA_IMPORT },
+                                colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Icon(Icons.Default.VideoLibrary, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Import Clips", fontSize = 13.sp)
+                            }
                         }
                     }
                 }
@@ -378,35 +601,53 @@ fun EditorScreen(
                 if (playbackState.errorMessage != null) {
                     Text(
                         text = "Playback: ${playbackState.errorMessage}",
-                        color = androidx.compose.ui.graphics.Color.Red,
+                        color = Color.Red,
                         fontSize = 11.sp,
                         modifier = Modifier.padding(12.dp)
                     )
                 }
             }
 
-            // Camera Angles Switcher Row (Only when 2+ angles exist)
+            // Camera Angles Switcher Row (Real-time live multi-cam switching)
             val videoMediaList = mediaList.filter { it.mediaType == MediaType.VIDEO }
             if (videoMediaList.size > 1) {
-                LazyRow(
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(DarkSurface)
-                        .padding(horizontal = 8.dp, vertical = 2.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        .background(DarkSurfaceElevated)
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    items(videoMediaList) { vMedia ->
-                        val isSelected = (playbackState.activeAngleMediaId ?: videoMediaList.first().id) == vMedia.id
-                        FilterChip(
-                            selected = isSelected,
-                            onClick = { playbackEngine.switchCameraAngle(vMedia.id) },
-                            label = { Text("Angle: ${vMedia.displayName}", fontSize = 11.sp) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = AccentBlue,
-                                selectedLabelColor = TextPrimary
+                    Text("ACTIVE ANGLE:", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = TextSecondary)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        items(videoMediaList) { vMedia ->
+                            val isSelected = (playbackState.activeAngleMediaId ?: videoMediaList.first().id) == vMedia.id
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = { playbackEngine.switchCameraAngle(vMedia.id) },
+                                label = { Text(vMedia.displayName, fontSize = 11.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = AccentBlue,
+                                    selectedLabelColor = TextPrimary
+                                )
                             )
-                        )
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            val activeId = playbackState.activeAngleMediaId ?: videoMediaList.first().id
+                            cutToAngleAtPlayhead(activeId)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = DarkSurface),
+                        shape = RoundedCornerShape(4.dp),
+                        modifier = Modifier.height(28.dp)
+                    ) {
+                        Text("Cut Angle", fontSize = 10.sp, color = AccentBlue, fontWeight = FontWeight.Bold)
                     }
                 }
             }
@@ -415,14 +656,14 @@ fun EditorScreen(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(DarkSurfaceElevated)
+                    .background(DarkSurface)
                     .padding(vertical = 4.dp),
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(
                     onClick = { playbackEngine.stepFrame(forward = false) },
-                    modifier = Modifier.size(48.dp)
+                    modifier = Modifier.size(46.dp)
                 ) {
                     Icon(Icons.Default.FastRewind, contentDescription = "Previous Frame", tint = TextPrimary)
                 }
@@ -431,7 +672,7 @@ fun EditorScreen(
                     onClick = {
                         if (playbackState.isPlaying) playbackEngine.pause() else playbackEngine.play()
                     },
-                    modifier = Modifier.size(48.dp)
+                    modifier = Modifier.size(46.dp)
                 ) {
                     Icon(
                         if (playbackState.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
@@ -442,16 +683,18 @@ fun EditorScreen(
 
                 IconButton(
                     onClick = { playbackEngine.stepFrame(forward = true) },
-                    modifier = Modifier.size(48.dp)
+                    modifier = Modifier.size(46.dp)
                 ) {
                     Icon(Icons.Default.FastForward, contentDescription = "Next Frame", tint = TextPrimary)
                 }
             }
 
-            // Stacked Multi-Track Timeline
+            // Stacked Multi-Track Timeline (V1, V2, V3, A1)
             TimelineView(
                 state = timelineState,
                 mediaMap = mediaMap,
+                audioEnvelopes = audioEnvelopes,
+                syncOffsets = syncOffsets,
                 projectFps = project.frameRate,
                 onSeekUs = { us ->
                     timelineManager.setPlayhead(us)
@@ -465,7 +708,7 @@ fun EditorScreen(
             )
         }
 
-        // --- Modals & Sheets (Cleanly Presented as ModalBottomSheet) ---
+        // --- Modals & Sheets (Interactive Drawer UI) ---
 
         if (activeSheet == EditorSheet.MEDIA_IMPORT) {
             ModalBottomSheet(
@@ -490,7 +733,7 @@ fun EditorScreen(
                             if (newMedia.isNotEmpty()) {
                                 repository.addMedia(newMedia)
 
-                                // Multi-Track Allocation: Create a separate Video Track (V1, V2, V3...) for each camera
+                                // Create a separate Stacked Track for each imported camera angle
                                 val currentTracks = timelineState.tracks.toMutableList()
                                 val currentClips = timelineState.clips.toMutableList()
 
@@ -510,14 +753,18 @@ fun EditorScreen(
                                         sourceMediaId = m.id,
                                         sourceInUs = 0L,
                                         sourceOutUs = m.durationUs,
-                                        timelineStartUs = 0L // All camera angles start stacked at timeline start 0
+                                        timelineStartUs = 0L
                                     )
                                     currentClips.add(newClip)
                                 }
 
                                 timelineManager.initialize(currentTracks, currentClips)
+                                activeSheet = EditorSheet.NONE
+
+                                // Automatically fire auto-sync on import if 2+ clips exist!
+                                delay(300)
+                                runAutoSync()
                             }
-                            activeSheet = EditorSheet.NONE
                         }
                     },
                     onAudioUrisSelected = { uris ->
@@ -539,7 +786,6 @@ fun EditorScreen(
                                 val currentTracks = timelineState.tracks.toMutableList()
                                 val currentClips = timelineState.clips.toMutableList()
 
-                                // Create or find dedicated Audio Track (A1)
                                 var audioTrack = currentTracks.firstOrNull { it.type == TrackType.AUDIO }
                                 if (audioTrack == null) {
                                     audioTrack = TimelineTrack(
@@ -566,8 +812,12 @@ fun EditorScreen(
 
                                 timelineManager.initialize(currentTracks, currentClips)
                                 referenceMediaId = newMedia.first().id
+                                activeSheet = EditorSheet.NONE
+
+                                // Automatically fire auto-sync with master audio!
+                                delay(300)
+                                runAutoSync()
                             }
-                            activeSheet = EditorSheet.NONE
                         }
                     }
                 )
@@ -583,34 +833,10 @@ fun EditorScreen(
                     mediaList = mediaList,
                     offsets = syncOffsets,
                     referenceMediaId = referenceMediaId ?: mediaList.firstOrNull { it.mediaType == MediaType.AUDIO }?.id ?: mediaList.firstOrNull()?.id,
+                    projectFps = project.frameRate,
                     onSelectReference = { id -> referenceMediaId = id },
-                    onRunAudioSync = {
-                        val refId = referenceMediaId ?: mediaList.firstOrNull()?.id ?: return@SyncWorkspaceSheet
-                        val updatedOffsets = mutableMapOf<String, SyncOffset>()
-                        var simulatedOffsetUs = 0L
-
-                        for (media in mediaList) {
-                            if (media.id == refId) {
-                                updatedOffsets[media.id] = SyncOffset(
-                                    syncGroupId = UUID.randomUUID().toString(),
-                                    mediaId = media.id,
-                                    offsetUs = 0L,
-                                    confidence = 1.0f
-                                )
-                            } else {
-                                simulatedOffsetUs += 150_000L // 150ms step per camera
-                                updatedOffsets[media.id] = SyncOffset(
-                                    syncGroupId = UUID.randomUUID().toString(),
-                                    mediaId = media.id,
-                                    offsetUs = simulatedOffsetUs,
-                                    confidence = 0.94f
-                                )
-                            }
-                        }
-                        syncOffsets = updatedOffsets
-                    },
+                    onRunAudioSync = { runAutoSync() },
                     onApplySyncToTimeline = {
-                        // Move each track's clip to its exact synchronized timeline start time
                         val updatedClips = timelineState.clips.map { clip ->
                             val offset = syncOffsets[clip.sourceMediaId]
                             if (offset != null) {
@@ -624,6 +850,24 @@ fun EditorScreen(
                         val current = syncOffsets[mediaId] ?: SyncOffset(syncGroupId = "", mediaId = mediaId)
                         val adjusted = syncEngine.adjustOffsetByFrames(current, delta, project.frameRate)
                         syncOffsets = syncOffsets.toMutableMap().apply { put(mediaId, adjusted) }
+                        val updatedClips = timelineState.clips.map { clip ->
+                            if (clip.sourceMediaId == mediaId) {
+                                clip.copy(timelineStartUs = adjusted.totalOffsetUs.coerceAtLeast(0L))
+                            } else clip
+                        }
+                        timelineManager.initialize(timelineState.tracks, updatedClips)
+                    },
+                    onAdjustOffsetMillis = { mediaId, millisDelta ->
+                        val current = syncOffsets[mediaId] ?: SyncOffset(syncGroupId = "", mediaId = mediaId)
+                        val newOffsetUs = (current.offsetUs + (millisDelta * 1000L)).coerceAtLeast(0L)
+                        val adjusted = current.copy(offsetUs = newOffsetUs)
+                        syncOffsets = syncOffsets.toMutableMap().apply { put(mediaId, adjusted) }
+                        val updatedClips = timelineState.clips.map { clip ->
+                            if (clip.sourceMediaId == mediaId) {
+                                clip.copy(timelineStartUs = adjusted.totalOffsetUs.coerceAtLeast(0L))
+                            } else clip
+                        }
+                        timelineManager.initialize(timelineState.tracks, updatedClips)
                     }
                 )
             }
@@ -636,6 +880,9 @@ fun EditorScreen(
             ) {
                 AutoCutReviewSheet(
                     suggestions = autoCutSuggestions,
+                    currentAggressiveness = autoCutAggressiveness,
+                    onSelectAggressiveness = { autoCutAggressiveness = it },
+                    onRunAutoCut = { runAutoCutSilences() },
                     onToggleSuggestion = { id ->
                         autoCutSuggestions = autoCutSuggestions.map {
                             if (it.id == id) it.copy(isAccepted = !it.isAccepted) else it
@@ -643,23 +890,12 @@ fun EditorScreen(
                     },
                     onApplySuggestions = {
                         val accepted = autoCutSuggestions.filter { it.isAccepted }
-                        val clip = timelineState.clips.firstOrNull()
-                        if (clip != null) {
-                            val keptSegments = autoCutEngine.computeKeptSegments(clip.durationUs, accepted)
-                            val newClips = mutableListOf<TimelineClip>()
-                            var startUs = 0L
-                            for ((inUs, outUs) in keptSegments) {
-                                newClips.add(
-                                    clip.copy(
-                                        id = UUID.randomUUID().toString(),
-                                        sourceInUs = inUs,
-                                        sourceOutUs = outUs,
-                                        timelineStartUs = startUs
-                                    )
-                                )
-                                startUs += (outUs - inUs)
-                            }
-                            timelineManager.initialize(timelineState.tracks, newClips)
+                        if (accepted.isNotEmpty()) {
+                            val cutClips = autoCutEngine.rippleCutSilencesAcrossAllTracks(
+                                currentClips = timelineState.clips,
+                                acceptedCuts = accepted
+                            )
+                            timelineManager.initialize(timelineState.tracks, cutClips)
                         }
                         activeSheet = EditorSheet.NONE
                     }

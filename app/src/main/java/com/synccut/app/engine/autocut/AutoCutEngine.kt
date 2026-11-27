@@ -1,67 +1,51 @@
 package com.synccut.app.engine.autocut
 
 import com.synccut.app.core.model.EditSuggestion
+import com.synccut.app.core.model.TimelineClip
+import com.synccut.app.core.model.TimelineTrack
 import java.util.UUID
 
 enum class AutoCutAggressiveness(
     val silenceThreshold: Float,
     val minSilenceDurationUs: Long,
-    val minShotLengthUs: Long,
-    val maxShotLengthUs: Long
+    val paddingUs: Long
 ) {
     CONSERVATIVE(
         silenceThreshold = 0.015f,
         minSilenceDurationUs = 1_500_000L, // 1.5s silence
-        minShotLengthUs = 2_000_000L,
-        maxShotLengthUs = 20_000_000L
+        paddingUs = 150_000L               // 150ms speech padding
     ),
     BALANCED(
         silenceThreshold = 0.025f,
-        minSilenceDurationUs = 1_000_000L, // 1.0s silence
-        minShotLengthUs = 1_500_000L,
-        maxShotLengthUs = 15_000_000L
+        minSilenceDurationUs = 800_000L,   // 0.8s silence
+        paddingUs = 100_000L               // 100ms speech padding
     ),
     AGGRESSIVE(
-        silenceThreshold = 0.040f,
-        minSilenceDurationUs = 600_000L,   // 0.6s silence
-        minShotLengthUs = 1_000_000L,
-        maxShotLengthUs = 8_000_000L
+        silenceThreshold = 0.035f,
+        minSilenceDurationUs = 500_000L,   // 0.5s silence
+        paddingUs = 60_000L                // 60ms speech padding
     )
 }
-
-data class VideoFrameAnalysis(
-    val timestampUs: Long,
-    val averageLuminance: Float, // 0.0 (black) to 1.0 (white)
-    val motionDiffScore: Float   // 0.0 (static) to 1.0 (rapid motion)
-)
 
 class AutoCutEngine {
 
     /**
-     * Deterministically analyzes audio and video metrics to produce explainable cut suggestions.
-     *
-     * @param sourceMediaId Target media identifier
-     * @param durationUs Total media duration in microseconds
-     * @param audioRmsEnvelope Array of RMS energy values sampled at [audioSampleRateHz]
-     * @param audioSampleRateHz Sampling rate of the RMS envelope (e.g. 100 Hz = 1 sample per 10ms)
-     * @param videoFrames Optional list of sampled frame metrics (for black frame & static detection)
-     * @param aggressiveness Configurable thresholds
+     * Deterministically analyzes audio RMS envelope to find silent blocks,
+     * protecting speech boundaries with padding.
      */
     fun analyzeMedia(
         sourceMediaId: String,
         durationUs: Long,
         audioRmsEnvelope: FloatArray,
-        audioSampleRateHz: Int = 100,
-        videoFrames: List<VideoFrameAnalysis> = emptyList(),
+        envelopeSampleRateHz: Int = 200,
         aggressiveness: AutoCutAggressiveness = AutoCutAggressiveness.BALANCED
     ): List<EditSuggestion> {
         val suggestions = mutableListOf<EditSuggestion>()
         if (durationUs <= 0L || audioRmsEnvelope.isEmpty()) return suggestions
 
-        val sampleDurationUs = 1_000_000L / audioSampleRateHz.toLong()
+        val sampleDurationUs = 1_000_000L / envelopeSampleRateHz.toLong()
         val minSilenceSamples = (aggressiveness.minSilenceDurationUs / sampleDurationUs).toInt()
 
-        // 1. Detect Long Silences
         var inSilence = false
         var silenceStartSample = 0
 
@@ -76,71 +60,29 @@ class AutoCutEngine {
                 if (inSilence) {
                     val silenceLengthSamples = i - silenceStartSample
                     if (silenceLengthSamples >= minSilenceSamples) {
-                        val inUs = silenceStartSample * sampleDurationUs
-                        val outUs = i * sampleDurationUs
-                        val dur = (outUs - inUs) / 1_000_000.0
+                        val rawInUs = silenceStartSample * sampleDurationUs
+                        val rawOutUs = i * sampleDurationUs
 
-                        suggestions.add(
-                            EditSuggestion(
-                                id = UUID.randomUUID().toString(),
-                                sourceMediaId = sourceMediaId,
-                                inUs = inUs,
-                                outUs = outUs.coerceAtMost(durationUs),
-                                score = 0.90f,
-                                reason = "Silence detected (duration: ${String.format("%.1f", dur)}s)",
-                                isAccepted = true
-                            )
-                        )
-                    }
-                    inSilence = false
-                }
-            }
-        }
+                        // Apply speech boundary protection padding
+                        val paddedInUs = (rawInUs + aggressiveness.paddingUs).coerceAtMost(rawOutUs)
+                        val paddedOutUs = (rawOutUs - aggressiveness.paddingUs).coerceAtLeast(paddedInUs)
 
-        // Catch trailing silence
-        if (inSilence) {
-            val silenceLengthSamples = audioRmsEnvelope.size - silenceStartSample
-            if (silenceLengthSamples >= minSilenceSamples) {
-                val inUs = silenceStartSample * sampleDurationUs
-                val outUs = durationUs
-                suggestions.add(
-                    EditSuggestion(
-                        id = UUID.randomUUID().toString(),
-                        sourceMediaId = sourceMediaId,
-                        inUs = inUs,
-                        outUs = outUs,
-                        score = 0.95f,
-                        reason = "Trailing silence at end of clip",
-                        isAccepted = true
-                    )
-                )
-            }
-        }
-
-        // 2. Detect Black Frames / Camera Obstructions (averageLuma < 0.03 for >= 500ms)
-        if (videoFrames.isNotEmpty()) {
-            var blackStartUs: Long? = null
-            for (frame in videoFrames) {
-                if (frame.averageLuminance < 0.03f) {
-                    if (blackStartUs == null) blackStartUs = frame.timestampUs
-                } else {
-                    if (blackStartUs != null) {
-                        val blackDur = frame.timestampUs - blackStartUs
-                        if (blackDur >= 500_000L) { // 500ms
+                        if (paddedOutUs - paddedInUs >= 300_000L) {
+                            val durSec = (paddedOutUs - paddedInUs) / 1_000_000.0
                             suggestions.add(
                                 EditSuggestion(
                                     id = UUID.randomUUID().toString(),
                                     sourceMediaId = sourceMediaId,
-                                    inUs = blackStartUs,
-                                    outUs = frame.timestampUs,
-                                    score = 0.95f,
-                                    reason = "Black frame / camera obstruction",
+                                    inUs = paddedInUs,
+                                    outUs = paddedOutUs.coerceAtMost(durationUs),
+                                    score = 0.92f,
+                                    reason = "Pause / Silence (${String.format("%.1f", durSec)}s)",
                                     isAccepted = true
                                 )
                             )
                         }
-                        blackStartUs = null
                     }
+                    inSilence = false
                 }
             }
         }
@@ -149,7 +91,7 @@ class AutoCutEngine {
     }
 
     /**
-     * Builds an updated list of keepable timeline segments after removing accepted cut suggestions.
+     * Calculates the non-silent kept timeline segments after removing accepted silence cuts.
      */
     fun computeKeptSegments(
         totalDurationUs: Long,
@@ -175,5 +117,71 @@ class AutoCutEngine {
         }
 
         return kept
+    }
+
+    /**
+     * Cuts silences across ALL tracks (V1, V2, V3, A1) simultaneously,
+     * ensuring all synchronized camera angles stay in perfect sync!
+     */
+    fun rippleCutSilencesAcrossAllTracks(
+        currentClips: List<TimelineClip>,
+        acceptedCuts: List<EditSuggestion>
+    ): List<TimelineClip> {
+        val cuts = acceptedCuts.filter { it.isAccepted }.sortedBy { it.inUs }
+        if (cuts.isEmpty()) return currentClips
+
+        // Process each cut in order
+        var resultClips = currentClips
+        for (cut in cuts.reversed()) { // Cut from back to front to preserve earlier offsets
+            val cutIn = cut.inUs
+            val cutOut = cut.outUs
+            val cutDuration = cutOut - cutIn
+            if (cutDuration <= 0L) continue
+
+            val nextClips = mutableListOf<TimelineClip>()
+            for (clip in resultClips) {
+                if (clip.timelineEndUs <= cutIn) {
+                    // Entirely before cut
+                    nextClips.add(clip)
+                } else if (clip.timelineStartUs >= cutOut) {
+                    // Entirely after cut: shift left by cutDuration
+                    nextClips.add(clip.copy(timelineStartUs = clip.timelineStartUs - cutDuration))
+                } else if (clip.timelineStartUs >= cutIn && clip.timelineEndUs <= cutOut) {
+                    // Completely inside cut range: delete!
+                } else if (clip.timelineStartUs < cutIn && clip.timelineEndUs > cutOut) {
+                    // Spans across the cut: split into 2 clips!
+                    val part1SourceOut = clip.sourceInUs + (cutIn - clip.timelineStartUs)
+                    val part1 = clip.copy(
+                        id = UUID.randomUUID().toString(),
+                        sourceOutUs = part1SourceOut
+                    )
+
+                    val part2SourceIn = clip.sourceInUs + (cutOut - clip.timelineStartUs)
+                    val part2 = clip.copy(
+                        id = UUID.randomUUID().toString(),
+                        sourceInUs = part2SourceIn,
+                        timelineStartUs = cutIn // shifts to where cut started
+                    )
+                    nextClips.add(part1)
+                    nextClips.add(part2)
+                } else if (clip.timelineStartUs < cutIn && clip.timelineEndUs > cutIn) {
+                    // Overlaps cut start: trim end
+                    val partSourceOut = clip.sourceInUs + (cutIn - clip.timelineStartUs)
+                    nextClips.add(clip.copy(sourceOutUs = partSourceOut))
+                } else if (clip.timelineStartUs < cutOut && clip.timelineEndUs > cutOut) {
+                    // Overlaps cut end: trim start and shift left
+                    val partSourceIn = clip.sourceInUs + (cutOut - clip.timelineStartUs)
+                    nextClips.add(
+                        clip.copy(
+                            sourceInUs = partSourceIn,
+                            timelineStartUs = cutIn
+                        )
+                    )
+                }
+            }
+            resultClips = nextClips
+        }
+
+        return resultClips.sortedBy { it.timelineStartUs }
     }
 }

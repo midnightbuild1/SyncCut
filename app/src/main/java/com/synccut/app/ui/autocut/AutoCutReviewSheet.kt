@@ -17,22 +17,27 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.synccut.app.core.model.EditSuggestion
 import com.synccut.app.core.model.TimeCode
+import com.synccut.app.engine.autocut.AutoCutAggressiveness
 import com.synccut.app.ui.theme.AccentBlue
 import com.synccut.app.ui.theme.DarkSurface
 import com.synccut.app.ui.theme.DarkSurfaceElevated
@@ -42,6 +47,9 @@ import com.synccut.app.ui.theme.TextSecondary
 @Composable
 fun AutoCutReviewSheet(
     suggestions: List<EditSuggestion>,
+    currentAggressiveness: AutoCutAggressiveness = AutoCutAggressiveness.BALANCED,
+    onSelectAggressiveness: (AutoCutAggressiveness) -> Unit = {},
+    onRunAutoCut: () -> Unit = {},
     onToggleSuggestion: (String) -> Unit,
     onApplySuggestions: () -> Unit
 ) {
@@ -61,14 +69,14 @@ fun AutoCutReviewSheet(
         ) {
             Column {
                 Text(
-                    text = "Auto-Cut Review",
+                    text = "Auto-Cut Silences",
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Bold,
                     color = TextPrimary
                 )
                 Text(
-                    text = "$acceptedCount suggested cuts (${TimeCode.formatDuration(totalCutDurationUs)} removed)",
-                    fontSize = 12.sp,
+                    text = if (acceptedCount > 0) "$acceptedCount cuts selected (${TimeCode.formatDuration(totalCutDurationUs)} dead air removed)" else "Detect and ripple-cut silent gaps across all cameras",
+                    fontSize = 11.sp,
                     color = TextSecondary
                 )
             }
@@ -76,16 +84,51 @@ fun AutoCutReviewSheet(
             Button(
                 onClick = onApplySuggestions,
                 enabled = acceptedCount > 0,
-                colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD97706)),
                 shape = RoundedCornerShape(8.dp)
             ) {
-                Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                Icon(Icons.Default.ContentCut, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(4.dp))
-                Text("Apply Cuts", fontSize = 13.sp)
+                Text("Cut Now", fontSize = 12.sp)
             }
         }
 
         Spacer(modifier = Modifier.height(12.dp))
+
+        // Sensitivity Filter Chips
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Mode:", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = TextSecondary)
+
+            AutoCutAggressiveness.entries.forEach { mode ->
+                FilterChip(
+                    selected = mode == currentAggressiveness,
+                    onClick = {
+                        onSelectAggressiveness(mode)
+                        onRunAutoCut()
+                    },
+                    label = {
+                        Text(
+                            when (mode) {
+                                AutoCutAggressiveness.CONSERVATIVE -> "Gentle (1.5s)"
+                                AutoCutAggressiveness.BALANCED -> "Balanced (0.8s)"
+                                AutoCutAggressiveness.AGGRESSIVE -> "Tight (0.5s)"
+                            },
+                            fontSize = 10.sp
+                        )
+                    },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = AccentBlue,
+                        selectedLabelColor = TextPrimary
+                    )
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
 
         if (suggestions.isEmpty()) {
             Box(
@@ -98,7 +141,16 @@ fun AutoCutReviewSheet(
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Icon(Icons.Default.AutoFixHigh, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(32.dp))
                     Spacer(modifier = Modifier.height(6.dp))
-                    Text("No cut suggestions. Run Auto-Cut analysis on imported footage.", color = TextSecondary, fontSize = 12.sp)
+                    Text("No pauses detected with current threshold.", color = TextSecondary, fontSize = 12.sp)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = onRunAutoCut,
+                        colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
+                        shape = RoundedCornerShape(6.dp),
+                        modifier = Modifier.height(32.dp)
+                    ) {
+                        Text("Analyze Audio", fontSize = 11.sp)
+                    }
                 }
             }
         } else {
