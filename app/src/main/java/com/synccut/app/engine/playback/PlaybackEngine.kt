@@ -27,7 +27,7 @@ data class PlaybackState(
     val currentPositionUs: Long = 0L,
     val totalDurationUs: Long = 0L,
     val isBuffering: Boolean = false,
-    val currentClipIndex: Int = 0,
+    val activeAngleMediaId: String? = null,
     val errorMessage: String? = null
 )
 
@@ -41,6 +41,7 @@ class PlaybackEngine(
 
     private var activeClips: List<TimelineClip> = emptyList()
     private var activeMediaMap: Map<String, SourceMedia> = emptyMap()
+    private var currentActiveMediaId: String? = null
     private var projectFps: Rational = Rational.FPS_30
 
     private val scope = CoroutineScope(Dispatchers.Main)
@@ -72,19 +73,11 @@ class PlaybackEngine(
                         updateState()
                     }
 
-                    override fun onPositionDiscontinuity(
-                        oldPosition: Player.PositionInfo,
-                        newPosition: Player.PositionInfo,
-                        reason: Int
-                    ) {
-                        updateState()
-                    }
-
                     override fun onPlayerError(error: PlaybackException) {
                         Log.e("PlaybackEngine", "ExoPlayer Error: ${error.errorCodeName}", error)
                         _playbackState.value = _playbackState.value.copy(
                             isPlaying = false,
-                            errorMessage = error.localizedMessage
+                            errorMessage = error.localizedMessage ?: "Playback error (${error.errorCodeName})"
                         )
                     }
                 })
@@ -96,7 +89,7 @@ class PlaybackEngine(
         progressJob = scope.launch {
             while (isActive) {
                 updateState()
-                delay(33) // ~30 fps position updates
+                delay(33) // ~30 fps updates
             }
         }
     }
@@ -107,10 +100,15 @@ class PlaybackEngine(
         updateState()
     }
 
-    fun prepareTimeline(
+    /**
+     * Prepares multi-cam playback for the timeline.
+     * Selects [targetMediaId] as the active preview camera angle, or the first available video clip.
+     */
+    fun prepareMultiCam(
         clips: List<TimelineClip>,
         mediaMap: Map<String, SourceMedia>,
-        fps: Rational
+        fps: Rational,
+        targetMediaId: String? = null
     ) {
         initialize()
         val player = exoPlayer ?: return
@@ -125,30 +123,56 @@ class PlaybackEngine(
             return
         }
 
-        var totalUs = 0L
-        val mediaItems = mutableListOf<MediaItem>()
+        // Determine which media to preview
+        val mediaIdToPlay = targetMediaId
+            ?: currentActiveMediaId
+            ?: activeClips.firstOrNull()?.sourceMediaId
 
-        for (clip in activeClips) {
-            val media = activeMediaMap[clip.sourceMediaId] ?: continue
-            val clippingConfig = MediaItem.ClippingConfiguration.Builder()
-                .setStartPositionUs(clip.sourceInUs)
-                .setEndPositionUs(clip.sourceOutUs)
-                .build()
+        currentActiveMediaId = mediaIdToPlay
+        val media = activeMediaMap[mediaIdToPlay]
 
-            val mediaItem = MediaItem.Builder()
-                .setUri(Uri.parse(media.uri))
-                .setClippingConfiguration(clippingConfig)
-                .build()
+        val maxEndUs = activeClips.maxOfOrNull { it.timelineEndUs } ?: 10_000_000L
 
-            mediaItems.add(mediaItem)
-            totalUs += clip.durationUs
+        if (media != null) {
+            val mediaItem = MediaItem.fromUri(Uri.parse(media.uri))
+            player.setMediaItem(mediaItem)
+            player.prepare()
+            _playbackState.value = _playbackState.value.copy(
+                totalDurationUs = maxEndUs,
+                activeAngleMediaId = mediaIdToPlay,
+                errorMessage = null
+            )
+        }
+    }
+
+    fun switchCameraAngle(mediaId: String) {
+        if (currentActiveMediaId == mediaId) return
+        val currentPosUs = _playbackState.value.currentPositionUs
+        val wasPlaying = _playbackState.value.isPlaying
+
+        currentActiveMediaId = mediaId
+        val media = activeMediaMap[mediaId] ?: return
+        val player = exoPlayer ?: return
+
+        // Find the clip for this angle
+        val clip = activeClips.firstOrNull { it.sourceMediaId == mediaId }
+        val sourceTimeUs = if (clip != null) {
+            (currentPosUs - clip.timelineStartUs + clip.sourceInUs).coerceIn(0L, clip.durationUs)
+        } else {
+            currentPosUs.coerceIn(0L, media.durationUs)
         }
 
-        player.setMediaItems(mediaItems)
+        val mediaItem = MediaItem.fromUri(Uri.parse(media.uri))
+        player.setMediaItem(mediaItem)
         player.prepare()
+        player.seekTo(sourceTimeUs / 1000L)
+        if (wasPlaying) {
+            player.play()
+        }
+
         _playbackState.value = _playbackState.value.copy(
-            totalDurationUs = totalUs,
-            errorMessage = null
+            activeAngleMediaId = mediaId,
+            currentPositionUs = currentPosUs
         )
     }
 
@@ -163,26 +187,18 @@ class PlaybackEngine(
 
     fun seekToUs(positionUs: Long) {
         val player = exoPlayer ?: return
-        if (activeClips.isEmpty()) return
+        val boundedUs = positionUs.coerceAtLeast(0L)
 
-        var accumulatedUs = 0L
-        for (index in activeClips.indices) {
-            val clip = activeClips[index]
-            val clipDurationUs = clip.durationUs
-            if (positionUs >= accumulatedUs && positionUs < accumulatedUs + clipDurationUs) {
-                val clipOffsetUs = positionUs - accumulatedUs
-                player.seekTo(index, clipOffsetUs / 1000L)
-                updateState()
-                return
-            }
-            accumulatedUs += clipDurationUs
+        val clip = activeClips.firstOrNull { it.sourceMediaId == currentActiveMediaId }
+        val targetSeekMs = if (clip != null) {
+            val sourceUs = boundedUs - clip.timelineStartUs + clip.sourceInUs
+            (sourceUs / 1000L).coerceAtLeast(0L)
+        } else {
+            boundedUs / 1000L
         }
 
-        if (activeClips.isNotEmpty()) {
-            val lastIdx = activeClips.size - 1
-            player.seekTo(lastIdx, activeClips[lastIdx].durationUs / 1000L)
-            updateState()
-        }
+        player.seekTo(targetSeekMs)
+        _playbackState.value = _playbackState.value.copy(currentPositionUs = boundedUs)
     }
 
     fun stepFrame(forward: Boolean) {
@@ -202,21 +218,21 @@ class PlaybackEngine(
 
     private fun updateState() {
         val player = exoPlayer ?: return
-        val currentWindowIndex = player.currentMediaItemIndex
-        val currentWindowPositionMs = player.currentPosition
+        val currentMs = player.currentPosition
 
-        var timelinePosUs = 0L
-        for (i in 0 until currentWindowIndex.coerceAtMost(activeClips.size)) {
-            timelinePosUs += activeClips[i].durationUs
+        val clip = activeClips.firstOrNull { it.sourceMediaId == currentActiveMediaId }
+        val timelineUs = if (clip != null) {
+            (currentMs * 1000L) + clip.timelineStartUs - clip.sourceInUs
+        } else {
+            currentMs * 1000L
         }
-        timelinePosUs += currentWindowPositionMs * 1000L
 
         val isBuffering = player.playbackState == Player.STATE_BUFFERING
         _playbackState.value = _playbackState.value.copy(
             isPlaying = player.isPlaying,
-            currentPositionUs = timelinePosUs,
+            currentPositionUs = timelineUs.coerceAtLeast(0L),
             isBuffering = isBuffering,
-            currentClipIndex = currentWindowIndex
+            activeAngleMediaId = currentActiveMediaId
         )
     }
 }

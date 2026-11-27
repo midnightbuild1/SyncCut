@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.CallSplit
 import androidx.compose.material.icons.automirrored.filled.Redo
@@ -37,6 +38,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
@@ -47,6 +49,7 @@ import com.synccut.app.core.model.Rational
 import com.synccut.app.core.model.SourceMedia
 import com.synccut.app.core.model.TimeCode
 import com.synccut.app.core.model.TimelineClip
+import com.synccut.app.core.model.TimelineTrack
 import com.synccut.app.core.model.TrackType
 import com.synccut.app.engine.timeline.TimelineState
 import com.synccut.app.ui.theme.AccentBlue
@@ -74,48 +77,42 @@ fun TimelineView(
     onUndo: () -> Unit,
     onRedo: () -> Unit
 ) {
-    // Zoom factor: pixels per second
-    var pxPerSecond by remember { mutableFloatStateOf(80f) }
-    val scrollState = rememberScrollState()
+    var pxPerSecond by remember { mutableFloatStateOf(70f) }
+    val horizontalScrollState = rememberScrollState()
 
-    // Separate clips by track type: Video vs Audio to prevent duplicate rendering
-    val videoTrackIds = remember(state.tracks) {
-        state.tracks.filter { it.type == TrackType.VIDEO }.map { it.id }.toSet()
-    }
-    val audioTrackIds = remember(state.tracks) {
-        state.tracks.filter { it.type == TrackType.AUDIO }.map { it.id }.toSet()
-    }
-
-    val videoClips = state.clips.filter { clip ->
-        if (videoTrackIds.isNotEmpty()) clip.trackId in videoTrackIds
-        else mediaMap[clip.sourceMediaId]?.mediaType != MediaType.AUDIO
-    }
-
-    val audioClips = state.clips.filter { clip ->
-        if (audioTrackIds.isNotEmpty()) clip.trackId in audioTrackIds
-        else mediaMap[clip.sourceMediaId]?.mediaType == MediaType.AUDIO
-    }
-
-    // Determine total timeline width
+    // Determine total timeline length
     val maxEndUs = state.clips.maxOfOrNull { it.timelineEndUs } ?: 10_000_000L
     val totalSeconds = (maxEndUs / 1_000_000L) + 5L
     val timelineWidthDp = (totalSeconds * pxPerSecond).dp
+
+    // Organize tracks: ensure tracks list has entries
+    val displayTracks = if (state.tracks.isNotEmpty()) {
+        state.tracks.sortedBy { it.order }
+    } else {
+        listOf(
+            TimelineTrack(projectId = "", type = TrackType.VIDEO, order = 0),
+            TimelineTrack(projectId = "", type = TrackType.AUDIO, order = 1)
+        )
+    }
+
+    val rowHeightDp = 48.dp
+    val totalTracksHeightDp = (rowHeightDp * displayTracks.size) + 26.dp // ruler 26dp
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(DarkSurface)
     ) {
-        // Timeline Header: Timecode + Edit Toolbar (Split, Delete, Undo, Redo)
+        // Toolbar: Timecode + Actions (Split, Delete, Undo, Redo)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(DarkSurfaceElevated)
-                .padding(horizontal = 8.dp, vertical = 4.dp),
+                .padding(horizontal = 10.dp, vertical = 2.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Current Timecode
+            // SMPTE Timecode
             Text(
                 text = TimeCode.formatSmpte(state.playheadUs, projectFps),
                 color = AccentBlue,
@@ -123,12 +120,12 @@ fun TimelineView(
                 fontWeight = FontWeight.Bold
             )
 
-            // Toolbar Controls (48dp touch targets)
+            // Edit Toolbar
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconButton(
                     onClick = onUndo,
                     enabled = state.canUndo,
-                    modifier = Modifier.size(48.dp)
+                    modifier = Modifier.size(44.dp)
                 ) {
                     Icon(
                         Icons.AutoMirrored.Filled.Undo,
@@ -140,7 +137,7 @@ fun TimelineView(
                 IconButton(
                     onClick = onRedo,
                     enabled = state.canRedo,
-                    modifier = Modifier.size(48.dp)
+                    modifier = Modifier.size(44.dp)
                 ) {
                     Icon(
                         Icons.AutoMirrored.Filled.Redo,
@@ -151,11 +148,11 @@ fun TimelineView(
 
                 IconButton(
                     onClick = onSplit,
-                    modifier = Modifier.size(48.dp)
+                    modifier = Modifier.size(44.dp)
                 ) {
                     Icon(
                         Icons.AutoMirrored.Filled.CallSplit,
-                        contentDescription = "Split at playhead",
+                        contentDescription = "Split Clip",
                         tint = TextPrimary
                     )
                 }
@@ -163,7 +160,7 @@ fun TimelineView(
                 IconButton(
                     onClick = { state.selectedClipId?.let { onDelete(it) } },
                     enabled = state.selectedClipId != null,
-                    modifier = Modifier.size(48.dp)
+                    modifier = Modifier.size(44.dp)
                 ) {
                     Icon(
                         Icons.Default.Delete,
@@ -174,137 +171,172 @@ fun TimelineView(
             }
         }
 
-        // Horizontal Scrollable Tracks Canvas
-        Box(
+        // Multi-Track Timeline: Left Headers + Right Horizontal Scroll Tracks
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(180.dp)
+                .height(totalTracksHeightDp.coerceIn(160.dp, 240.dp))
                 .background(DarkBackground)
-                .horizontalScroll(scrollState)
-                .pointerInput(Unit) {
-                    detectTapGestures { offset ->
-                        val clickedSec = offset.x / pxPerSecond
-                        val clickedUs = (clickedSec * 1_000_000L).toLong().coerceAtLeast(0L)
-                        onSeekUs(clickedUs)
-                    }
-                }
         ) {
-            Box(
+            // Pinned Left Track Headers (V1, V2, A1)
+            Column(
                 modifier = Modifier
-                    .width(timelineWidthDp)
+                    .width(52.dp)
                     .fillMaxHeight()
+                    .background(DarkSurfaceElevated)
+                    .border(1.dp, BorderStroke)
             ) {
-                // Time Ruler (Top 24dp)
-                Canvas(
+                // Header spacer for ruler
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(24.dp)
+                        .background(DarkSurface),
+                    contentAlignment = Alignment.Center
                 ) {
-                    val secWidth = pxPerSecond
-                    for (s in 0..totalSeconds.toInt()) {
-                        val x = s * secWidth
-                        // Major tick per second
-                        drawLine(
-                            color = BorderStroke,
-                            start = Offset(x, 10f),
-                            end = Offset(x, 24f),
-                            strokeWidth = 2f
+                    Text("TRACK", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = TextSecondary)
+                }
+
+                displayTracks.forEachIndexed { index, track ->
+                    val isVideo = track.type == TrackType.VIDEO
+                    val label = if (isVideo) "V${index + 1}" else "A${index + 1 - displayTracks.count { it.type == TrackType.VIDEO }}"
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(rowHeightDp)
+                            .border(0.5.dp, BorderStroke)
+                            .background(if (isVideo) DarkSurfaceElevated else DarkSurface),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = label,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isVideo) AccentBlue else AccentGreen
                         )
                     }
                 }
+            }
 
-                // Video Track (Y: 28dp to 92dp) - ONLY contains video clips
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .offset { IntOffset(0, 32.dp.roundToPx()) }
-                        .height(60.dp)
-                        .background(DarkSurfaceElevated.copy(alpha = 0.4f))
-                ) {
-                    videoClips.forEach { clip ->
-                        val clipStartSec = clip.timelineStartUs / 1_000_000f
-                        val clipDurationSec = clip.durationUs / 1_000_000f
-                        val leftDp = (clipStartSec * pxPerSecond).dp
-                        val widthDp = (clipDurationSec * pxPerSecond).coerceAtLeast(20f).dp
-                        val isSelected = clip.id == state.selectedClipId
-                        val media = mediaMap[clip.sourceMediaId]
-
-                        Box(
-                            modifier = Modifier
-                                .offset { IntOffset(leftDp.roundToPx(), 0) }
-                                .width(widthDp)
-                                .height(56.dp)
-                                .background(TrackVideoColor, RoundedCornerShape(4.dp))
-                                .border(
-                                    2.dp,
-                                    if (isSelected) AccentBlue else BorderStroke,
-                                    RoundedCornerShape(4.dp)
-                                )
-                                .clickable { onSelectClip(clip.id) }
-                                .padding(horizontal = 4.dp, vertical = 2.dp)
-                        ) {
-                            Text(
-                                text = media?.displayName ?: "Video",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = TextPrimary,
-                                maxLines = 1
-                            )
+            // Scrollable Timeline Tracks Canvas
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .horizontalScroll(horizontalScrollState)
+                    .pointerInput(Unit) {
+                        detectTapGestures { offset ->
+                            val clickedSec = offset.x / pxPerSecond
+                            val clickedUs = (clickedSec * 1_000_000L).toLong().coerceAtLeast(0L)
+                            onSeekUs(clickedUs)
                         }
                     }
-                }
-
-                // Audio Track (Y: 100dp to 156dp) - ONLY contains audio clips
+            ) {
                 Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .offset { IntOffset(0, 100.dp.roundToPx()) }
-                        .height(48.dp)
-                        .background(DarkSurfaceElevated.copy(alpha = 0.2f))
-                ) {
-                    audioClips.forEach { clip ->
-                        val clipStartSec = clip.timelineStartUs / 1_000_000f
-                        val clipDurationSec = clip.durationUs / 1_000_000f
-                        val leftDp = (clipStartSec * pxPerSecond).dp
-                        val widthDp = (clipDurationSec * pxPerSecond).coerceAtLeast(20f).dp
-                        val isSelected = clip.id == state.selectedClipId
-                        val media = mediaMap[clip.sourceMediaId]
-
-                        Box(
-                            modifier = Modifier
-                                .offset { IntOffset(leftDp.roundToPx(), 0) }
-                                .width(widthDp)
-                                .height(44.dp)
-                                .background(TrackAudioColor, RoundedCornerShape(4.dp))
-                                .border(
-                                    2.dp,
-                                    if (isSelected) AccentGreen else BorderStroke,
-                                    RoundedCornerShape(4.dp)
-                                )
-                                .clickable { onSelectClip(clip.id) }
-                                .padding(4.dp)
-                        ) {
-                            Text(
-                                text = media?.displayName ?: "Audio",
-                                fontSize = 10.sp,
-                                color = TextPrimary,
-                                maxLines = 1
-                            )
-                        }
-                    }
-                }
-
-                // Playhead Vertical Line with Head Cursor
-                val playheadSec = state.playheadUs / 1_000_000f
-                val playheadXDp = (playheadSec * pxPerSecond).dp
-
-                Box(
-                    modifier = Modifier
-                        .offset { IntOffset(playheadXDp.roundToPx() - 1.dp.roundToPx(), 0) }
-                        .width(2.dp)
+                        .width(timelineWidthDp)
                         .fillMaxHeight()
-                        .background(PlayheadColor)
-                )
+                ) {
+                    // Time Ruler
+                    Canvas(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(24.dp)
+                    ) {
+                        val secWidth = pxPerSecond
+                        for (s in 0..totalSeconds.toInt()) {
+                            val x = s * secWidth
+                            drawLine(
+                                color = BorderStroke,
+                                start = Offset(x, 8f),
+                                end = Offset(x, 24f),
+                                strokeWidth = 1.5f
+                            )
+                        }
+                    }
+
+                    // Stacked Track Rows
+                    displayTracks.forEachIndexed { trackIndex, track ->
+                        val topY = (24.dp + (rowHeightDp * trackIndex))
+                        val isVideo = track.type == TrackType.VIDEO
+                        val trackClips = state.clips.filter { it.trackId == track.id }
+
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .offset { IntOffset(0, topY.roundToPx()) }
+                                .height(rowHeightDp)
+                                .border(0.5.dp, BorderStroke)
+                                .background(if (isVideo) DarkSurfaceElevated.copy(alpha = 0.3f) else DarkSurface.copy(alpha = 0.5f))
+                        ) {
+                            trackClips.forEach { clip ->
+                                val clipStartSec = clip.timelineStartUs / 1_000_000f
+                                val clipDurationSec = clip.durationUs / 1_000_000f
+                                val leftDp = (clipStartSec * pxPerSecond).dp
+                                val widthDp = (clipDurationSec * pxPerSecond).coerceAtLeast(24f).dp
+                                val isSelected = clip.id == state.selectedClipId
+                                val media = mediaMap[clip.sourceMediaId]
+
+                                Box(
+                                    modifier = Modifier
+                                        .offset { IntOffset(leftDp.roundToPx(), 0) }
+                                        .width(widthDp)
+                                        .height(rowHeightDp - 4.dp)
+                                        .background(
+                                            if (isVideo) TrackVideoColor else TrackAudioColor,
+                                            RoundedCornerShape(4.dp)
+                                        )
+                                        .border(
+                                            2.dp,
+                                            if (isSelected) AccentBlue else BorderStroke,
+                                            RoundedCornerShape(4.dp)
+                                        )
+                                        .clickable { onSelectClip(clip.id) }
+                                        .padding(horizontal = 4.dp, vertical = 2.dp)
+                                ) {
+                                    if (isVideo) {
+                                        Text(
+                                            text = media?.displayName ?: "Video Angle",
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = TextPrimary,
+                                            maxLines = 1
+                                        )
+                                    } else {
+                                        // Visual Audio Waveform representation
+                                        Row(
+                                            modifier = Modifier.fillMaxSize(),
+                                            horizontalArrangement = Arrangement.SpaceEvenly,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            for (i in 0 until (widthDp.value / 8f).toInt().coerceAtMost(25)) {
+                                                val barHeight = ((i % 5) * 5 + 6).dp
+                                                Box(
+                                                    modifier = Modifier
+                                                        .width(2.dp)
+                                                        .height(barHeight)
+                                                        .background(AccentGreen.copy(alpha = 0.8f))
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Vertical Playhead Line across all tracks
+                    val playheadSec = state.playheadUs / 1_000_000f
+                    val playheadXDp = (playheadSec * pxPerSecond).dp
+
+                    Box(
+                        modifier = Modifier
+                            .offset { IntOffset(playheadXDp.roundToPx() - 1.dp.roundToPx(), 0) }
+                            .width(2.5.dp)
+                            .fillMaxHeight()
+                            .background(PlayheadColor)
+                    )
+                }
             }
         }
     }
